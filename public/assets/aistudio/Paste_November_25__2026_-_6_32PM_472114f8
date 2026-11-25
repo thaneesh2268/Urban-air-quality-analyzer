@@ -1,0 +1,727 @@
+#include <ctype.h>
+#include <limits.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define MAX_CONCENTRATION 10000L
+#define HISTORY_LIMIT 10
+#define AREA_NAME_CAPACITY 128
+#define INPUT_CAPACITY 256
+#define BREAKPOINT_COUNT 6
+#define FINE_PARTICLE_SCALE 10L
+#define INHALABLE_PARTICLE_SCALE 1L
+#define ARRAY_COUNT(array) (sizeof(array) / sizeof((array)[0]))
+
+/* Guard the intermediate multiplication if the input limit is edited. */
+_Static_assert(MAX_CONCENTRATION > 0 &&
+               MAX_CONCENTRATION <= (LONG_MAX - 500L) / 5000L,
+               "The concentration limit must fit long integer arithmetic.");
+_Static_assert(HISTORY_LIMIT > 0, "History must hold at least one reading.");
+_Static_assert(AREA_NAME_CAPACITY >= 2 && INPUT_CAPACITY >= 2,
+               "Text buffers need space for a character and a terminator.");
+
+typedef struct {
+    long concentration_low;
+    long concentration_high;
+    long index_low;
+    long index_high;
+} AqiBreakpoint;
+
+typedef struct {
+    char area_name[AREA_NAME_CAPACITY];
+    long fine_particle_tenths;    /* PM2.5: 355 represents 35.5 micrograms/m3. */
+    long inhalable_particles;    /* PM10: whole micrograms/m3. */
+    long fine_particle_aqi;
+    long inhalable_particle_aqi;
+    long overall_aqi;
+    size_t category_index;
+} AirQualityReading;
+
+/* Scaled integers preserve decimal truncation without floating-point error. */
+static const AqiBreakpoint FINE_PARTICLE_BREAKPOINTS[BREAKPOINT_COUNT] = {
+    {   0,   90,   0,  50},
+    {  91,  354,  51, 100},
+    { 355,  554, 101, 150},
+    { 555, 1254, 151, 200},
+    {1255, 2254, 201, 300},
+    {2255, 3254, 301, 500}
+};
+
+static const AqiBreakpoint INHALABLE_PARTICLE_BREAKPOINTS[BREAKPOINT_COUNT] = {
+    {  0,  54,   0,  50},
+    { 55, 154,  51, 100},
+    {155, 254, 101, 150},
+    {255, 354, 151, 200},
+    {355, 424, 201, 300},
+    {425, 604, 301, 500}
+};
+
+static const char *const CATEGORY_NAMES[BREAKPOINT_COUNT] = {
+    "Good", "Moderate", "Unhealthy for Sensitive Groups",
+    "Unhealthy", "Very Unhealthy", "Hazardous"
+};
+
+static const char *const ACTIVITY_GUIDANCE[BREAKPOINT_COUNT] = {
+    "Outdoor activities are generally suitable.",
+    "Unusually sensitive people should consider reducing prolonged or\n"
+    "heavy outdoor exertion.",
+    "Sensitive groups should reduce prolonged or heavy outdoor exertion.",
+    "Everyone should reduce prolonged or heavy outdoor exertion.\n"
+    "Sensitive groups should avoid prolonged or heavy outdoor exertion.",
+    "Everyone should avoid prolonged or heavy outdoor exertion.\n"
+    "Sensitive groups should avoid outdoor physical activity.",
+    "Everyone should avoid outdoor physical activity and seek cleaner\n"
+    "indoor air. Follow local public-health guidance."
+};
+
+static void trim_surrounding_whitespace(char *text)
+{
+    size_t first = 0;
+    size_t last = strlen(text);
+
+    while (first < last && isspace((unsigned char)text[first])) {
+        ++first;
+    }
+    while (last > first && isspace((unsigned char)text[last - 1])) {
+        --last;
+    }
+    /* The source and destination may overlap, so use memmove. */
+    memmove(text, text + first, last - first);
+    text[last - first] = '\0';
+}
+
+/*
+ * Read and consume a whole line using buffered standard input.
+ * Store at most capacity - 1 bytes. Even rejected lines are fully consumed,
+ * so leftover characters cannot become the next menu choice or reading.
+ * Character-by-character reading also detects embedded null bytes.
+ * All callers pass non-null pointers and a buffer capacity of at least 2.
+ */
+static bool read_console_line(const char *prompt, char *buffer, size_t capacity)
+{
+    for (;;) {
+        size_t length = 0;
+        bool received_input = false;
+        bool too_long = false;
+        bool invalid_character = false;
+        int character;
+
+        fputs(prompt, stdout);
+        fflush(stdout);
+
+        while ((character = fgetc(stdin)) != '\n' && character != EOF) {
+            received_input = true;
+            if (character == '\0' ||
+                (iscntrl((unsigned char)character) &&
+                 character != '\t' && character != '\r')) {
+                invalid_character = true;
+            }
+            if (length + 1 < capacity) {
+                buffer[length++] = (char)character;
+            } else {
+                too_long = true;
+            }
+        }
+        if (ferror(stdin) || (character == EOF && !received_input)) {
+            return false;
+        }
+        buffer[length] = '\0';
+
+        if (!invalid_character && !too_long) {
+            trim_surrounding_whitespace(buffer);
+            /* Reject internal tabs/carriage returns that could alter reports. */
+            for (size_t position = 0; buffer[position] != '\0'; ++position) {
+                if (iscntrl((unsigned char)buffer[position])) {
+                    invalid_character = true;
+                }
+            }
+        }
+        if (too_long) {
+            printf("Input is too long. Enter at most %zu bytes of text.\n",
+                   capacity - 1);
+        } else if (invalid_character) {
+            puts("Input contains a control character. Please enter ordinary text.");
+        } else {
+            return true;
+        }
+        /* A rejected final line must not cause endless retries at EOF. */
+        if (character == EOF) {
+            return false;
+        }
+    }
+}
+
+/*
+ * Accept an ordinary non-negative decimal, with an optional leading '+'.
+ * Reject extra text, exponents, negative values and out-of-range input.
+ * Extra fractional digits are discarded, not rounded:
+ *   PM2.5: "35.49" -> 354 tenths; PM10: "54.99" -> 54.
+ * The output is assigned only after the entire input has been validated.
+ * The caller supplies a null-terminated string and a valid result pointer.
+ */
+static bool parse_concentration(const char *text, long scale, long *result)
+{
+    const unsigned char *cursor = (const unsigned char *)text;
+    long whole_part = 0;
+    long first_decimal = 0;
+    bool found_digit = false;
+
+    if ((scale != FINE_PARTICLE_SCALE && scale != INHALABLE_PARTICLE_SCALE) ||
+        strlen(text) >= INPUT_CAPACITY) {
+        return false;
+    }
+    while (isspace(*cursor)) {
+        ++cursor;
+    }
+    if (*cursor == '+') {
+        ++cursor;
+    }
+    while (*cursor >= '0' && *cursor <= '9') {
+        long digit = *cursor - '0';
+        /* Check the limit before multiplying, preventing integer overflow. */
+        if (whole_part > MAX_CONCENTRATION / 10L ||
+            (whole_part == MAX_CONCENTRATION / 10L &&
+             digit > MAX_CONCENTRATION % 10L)) {
+            return false;
+        }
+        whole_part = whole_part * 10L + digit;
+        found_digit = true;
+        ++cursor;
+    }
+    if (*cursor == '.') {
+        ++cursor;
+        if (*cursor >= '0' && *cursor <= '9') {
+            first_decimal = *cursor - '0';
+        }
+        while (*cursor >= '0' && *cursor <= '9') {
+            found_digit = true;
+            if (whole_part == MAX_CONCENTRATION && *cursor != '0') {
+                return false;
+            }
+            ++cursor;
+        }
+    }
+    while (isspace(*cursor)) {
+        ++cursor;
+    }
+    if (!found_digit || *cursor != '\0') {
+        return false;
+    }
+    *result = whole_part * scale +
+              (scale == FINE_PARTICLE_SCALE ? first_decimal : 0);
+    return true;
+}
+
+static bool prompt_for_concentration(const char *prompt, long scale, long *result)
+{
+    char input[INPUT_CAPACITY];
+
+    while (read_console_line(prompt, input, sizeof input)) {
+        if (parse_concentration(input, scale, result)) {
+            return true;
+        }
+        printf("Invalid concentration. Enter a decimal from 0 to %ld,\n"
+               "for example 35.5. Use a decimal point and omit unit text.\n",
+               MAX_CONCENTRATION);
+    }
+    return false;
+}
+
+/* Precondition: concentration has passed parse_concentration. */
+static long calculate_pollutant_aqi(long concentration,
+                                   const AqiBreakpoint breakpoints[])
+{
+    size_t band_index = 0;
+    while (band_index + 1 < BREAKPOINT_COUNT &&
+           concentration > breakpoints[band_index].concentration_high) {
+        ++band_index;
+    }
+    const AqiBreakpoint *band = &breakpoints[band_index];
+    long concentration_span = band->concentration_high - band->concentration_low;
+    long index_span = band->index_high - band->index_low;
+    long numerator = (concentration - band->concentration_low) * index_span;
+
+    /*
+     * Linear interpolation, rounded to the nearest integer (half up).
+     * The final band's slope continues above AQI 500; the result is not capped.
+     */
+    return band->index_low +
+           (numerator + concentration_span / 2) / concentration_span;
+}
+
+static size_t classify_air_quality(long air_quality_index)
+{
+    if (air_quality_index <= 50)  return 0;
+    if (air_quality_index <= 100) return 1;
+    if (air_quality_index <= 150) return 2;
+    if (air_quality_index <= 200) return 3;
+    if (air_quality_index <= 300) return 4;
+    return 5;
+}
+
+/* Shared by console, demo and JSON output so the calculation cannot drift. */
+static void analyze_reading(AirQualityReading *reading)
+{
+    reading->fine_particle_aqi = calculate_pollutant_aqi(
+        reading->fine_particle_tenths, FINE_PARTICLE_BREAKPOINTS);
+    reading->inhalable_particle_aqi = calculate_pollutant_aqi(
+        reading->inhalable_particles, INHALABLE_PARTICLE_BREAKPOINTS);
+    reading->overall_aqi = reading->fine_particle_aqi > reading->inhalable_particle_aqi
+        ? reading->fine_particle_aqi : reading->inhalable_particle_aqi;
+    reading->category_index = classify_air_quality(reading->overall_aqi);
+}
+
+static bool uses_extrapolation(const AirQualityReading *reading)
+{
+    return reading->fine_particle_tenths >
+               FINE_PARTICLE_BREAKPOINTS[BREAKPOINT_COUNT - 1].concentration_high ||
+           reading->inhalable_particles >
+               INHALABLE_PARTICLE_BREAKPOINTS[BREAKPOINT_COUNT - 1].concentration_high;
+}
+
+static bool area_names_match(const char *first, const char *second)
+{
+    while (*first != '\0' && *second != '\0' &&
+           tolower((unsigned char)*first) == tolower((unsigned char)*second)) {
+        ++first;
+        ++second;
+    }
+    return *first == *second;
+}
+
+static const AirQualityReading *find_previous_reading(
+    const AirQualityReading history[], size_t count, const char *area_name)
+{
+    for (size_t position = count; position > 0; --position) {
+        if (area_names_match(history[position - 1].area_name, area_name)) {
+            return &history[position - 1];
+        }
+    }
+    return NULL;
+}
+
+static void print_comparison(const AirQualityReading history[], size_t count,
+                            const AirQualityReading *current)
+{
+    const AirQualityReading *previous =
+        find_previous_reading(history, count, current->area_name);
+
+    if (previous == NULL) {
+        puts("Comparison: no previous reading for this area in recent history.");
+        return;
+    }
+    long change = current->overall_aqi - previous->overall_aqi;
+    if (change == 0) {
+        puts("Comparison: Air Quality Index unchanged from this area's last entry.");
+    } else {
+        printf("Comparison: Air Quality Index is %ld points %s than this area's\n"
+               "last entry.\n", change < 0 ? -change : change,
+               change < 0 ? "lower" : "higher");
+    }
+}
+
+static void print_summary_report(const AirQualityReading *reading,
+                                 const AirQualityReading history[], size_t count)
+{
+    puts("\n======================================================================");
+    puts("                         AIR QUALITY SUMMARY");
+    puts("======================================================================");
+    printf("Area or city       : %s\n", reading->area_name);
+    puts("Averaging period   : 24 hours");
+    puts("Concentration units: micrograms per cubic meter");
+    puts("----------------------------------------------------------------------");
+    printf("%-37s %13s %15s\n", "Pollutant", "Concentration", "Pollutant AQI");
+    printf("%-37s %11ld.%ld %15ld\n", "Fine Particulate Matter (PM2.5)",
+           reading->fine_particle_tenths / 10, reading->fine_particle_tenths % 10,
+           reading->fine_particle_aqi);
+    printf("%-37s %13ld %15ld\n", "Inhalable Particulate Matter (PM10)",
+           reading->inhalable_particles, reading->inhalable_particle_aqi);
+    puts("Values above use EPA truncation: one decimal for PM2.5, whole PM10.");
+    puts("----------------------------------------------------------------------");
+    printf("Overall Air Quality Index (AQI): %ld\n", reading->overall_aqi);
+    printf("Air quality category           : %s\n",
+           CATEGORY_NAMES[reading->category_index]);
+    fputs("Main contributing pollutant    : ", stdout);
+    if (reading->fine_particle_aqi == reading->inhalable_particle_aqi) {
+        puts("PM2.5 and PM10 (equal AQI values)");
+    } else if (reading->fine_particle_aqi > reading->inhalable_particle_aqi) {
+        puts("Fine Particulate Matter (PM2.5)");
+    } else {
+        puts("Inhalable Particulate Matter (PM10)");
+    }
+    long filled_segments = reading->overall_aqi >= 500
+        ? 20 : (reading->overall_aqi * 20 + 250) / 500;
+    fputs("AQI indicator (scale 0 to 500)  : [", stdout);
+    for (long segment = 0; segment < 20; ++segment) {
+        putchar(segment < filled_segments ? '#' : '.');
+    }
+    puts(reading->overall_aqi > 500 ? "] above display scale" : "]");
+    puts("\nACTIVITY GUIDANCE");
+    puts(ACTIVITY_GUIDANCE[reading->category_index]);
+    if (reading->category_index >= 2) {
+        puts("Sensitive groups include children, older adults, and people");
+        puts("with heart or lung disease.");
+    }
+    putchar('\n');
+    print_comparison(history, count, reading);
+    if (uses_extrapolation(reading)) {
+        puts("A concentration exceeds its AQI-500 reference. The estimate");
+        puts("extends the final breakpoint band's slope.");
+    }
+    puts("Scope: particle pollution only; other pollutants may raise city AQI.");
+    puts("======================================================================");
+}
+
+static void save_reading(AirQualityReading history[], size_t *count,
+                        const AirQualityReading *reading)
+{
+    /* A fixed array bounds memory use. Shift out the oldest entry when full. */
+    if (*count == HISTORY_LIMIT) {
+        for (size_t position = 1; position < *count; ++position) {
+            history[position - 1] = history[position];
+        }
+        --*count;
+    }
+    history[*count] = *reading; /* Structure assignment copies the complete record. */
+    ++*count;
+}
+
+static void print_reading_history(const AirQualityReading history[], size_t count)
+{
+    puts("\n=================== RECENT AIR QUALITY READINGS ======================");
+    if (count == 0) {
+        puts("No readings saved. Choose menu option 1 to calculate a first result.");
+        return;
+    }
+    puts("Oldest first. All concentrations are 24-hour averages in");
+    puts("micrograms per cubic meter.");
+    puts("PM2.5 = Fine Particulate Matter; PM10 = Inhalable Particulate Matter.");
+    puts("AQI = Air Quality Index. Lower values indicate less particle pollution.");
+    for (size_t position = 0; position < count; ++position) {
+        const AirQualityReading *reading = &history[position];
+        printf("\n%zu. Area: %s\n", position + 1, reading->area_name);
+        printf("   PM2.5: %ld.%ld | PM10: %ld | AQI: %ld\n",
+               reading->fine_particle_tenths / 10, reading->fine_particle_tenths % 10,
+               reading->inhalable_particles, reading->overall_aqi);
+        printf("   Category: %s\n", CATEGORY_NAMES[reading->category_index]);
+    }
+    printf("\nShown: %zu recent reading(s).\n", count);
+    printf("Manual history limit: %d entries per session.\n", HISTORY_LIMIT);
+}
+
+static bool check_area_air_quality(AirQualityReading history[], size_t *count)
+{
+    AirQualityReading current = {0};
+
+    if (!read_console_line(
+            "\nEnter an area or city name (example: Central District).\n"
+            "Leave the name blank to return to the main menu: ",
+            current.area_name, sizeof current.area_name)) {
+        return false;
+    }
+    if (current.area_name[0] == '\0') {
+        puts("Reading cancelled. Returning to the main menu.");
+        return true;
+    }
+    if (!prompt_for_concentration(
+            "Enter Fine Particulate Matter (PM2.5) in micrograms per cubic meter\n"
+            "(24-hour average; example: 35.5): ",
+            FINE_PARTICLE_SCALE, &current.fine_particle_tenths) ||
+        !prompt_for_concentration(
+            "Enter Inhalable Particulate Matter (PM10) in micrograms per cubic meter\n"
+            "(24-hour average; example: 80): ",
+            INHALABLE_PARTICLE_SCALE, &current.inhalable_particles)) {
+        return false;
+    }
+    analyze_reading(&current);
+    print_summary_report(&current, history, *count);
+    save_reading(history, count, &current);
+    puts("The completed reading has been saved in this session's history.");
+    return true;
+}
+
+static void run_sample_demonstration(void)
+{
+    AirQualityReading samples[] = {
+        {.area_name = "Demo Central District",
+         .fine_particle_tenths = 800, .inhalable_particles = 180},
+        {.area_name = "Demo Central District",
+         .fine_particle_tenths = 250, .inhalable_particles = 85},
+        {.area_name = "Demo Central District",
+         .fine_particle_tenths = 60, .inhalable_particles = 30}
+    };
+
+    puts("\nDEMONSTRATION: fictional 24-hour averages for three consecutive days.");
+    puts("These examples have their own history, separate from your readings.");
+    for (size_t day = 0; day < ARRAY_COUNT(samples); ++day) {
+        printf("\nSAMPLE DAY %zu\n", day + 1);
+        analyze_reading(&samples[day]);
+        print_summary_report(&samples[day], samples, day);
+    }
+    print_reading_history(samples, ARRAY_COUNT(samples));
+}
+
+static void print_json_string(const char *text)
+{
+    putchar('"');
+    for (const unsigned char *character = (const unsigned char *)text;
+         *character != '\0'; ++character) {
+        switch (*character) {
+            case '"':  fputs("\\\"", stdout); break;
+            case '\\': fputs("\\\\", stdout); break;
+            case '\n': fputs("\\n", stdout);  break;
+            case '\r': fputs("\\r", stdout);  break;
+            case '\t': fputs("\\t", stdout);  break;
+            default:
+                if (*character < 32) {
+                    printf("\\u%04x", (unsigned int)*character);
+                } else {
+                    putchar(*character);
+                }
+        }
+    }
+    putchar('"');
+}
+
+/* Preserve the existing JSON field names used by the browser interface. */
+static int print_json_report(const char *fine_text, const char *inhalable_text)
+{
+    AirQualityReading reading = {0};
+    if (!parse_concentration(fine_text, FINE_PARTICLE_SCALE,
+                             &reading.fine_particle_tenths) ||
+        !parse_concentration(inhalable_text, INHALABLE_PARTICLE_SCALE,
+                             &reading.inhalable_particles)) {
+        fprintf(stderr, "Invalid concentration. Enter decimals from 0 to %ld\n"
+                "micrograms per cubic meter, for example: --json 35.5 80\n",
+                MAX_CONCENTRATION);
+        return EXIT_FAILURE;
+    }
+    analyze_reading(&reading);
+    const char *dominant_pollutant =
+        reading.fine_particle_aqi == reading.inhalable_particle_aqi
+        ? "PM2.5 and PM10"
+        : reading.fine_particle_aqi > reading.inhalable_particle_aqi ? "PM2.5" : "PM10";
+
+    printf("{\"pm25\":%ld.%ld,\"pm10\":%ld,\"pm25_aqi\":%ld,\"pm10_aqi\":%ld,"
+           "\"aqi\":%ld,\"category_index\":%zu,\"category\":",
+           reading.fine_particle_tenths / 10, reading.fine_particle_tenths % 10,
+           reading.inhalable_particles, reading.fine_particle_aqi,
+           reading.inhalable_particle_aqi, reading.overall_aqi, reading.category_index);
+    print_json_string(CATEGORY_NAMES[reading.category_index]);
+    fputs(",\"advice\":", stdout);
+    print_json_string(ACTIVITY_GUIDANCE[reading.category_index]);
+    fputs(",\"dominant\":", stdout);
+    print_json_string(dominant_pollutant);
+    printf(",\"extrapolated\":%s}\n", uses_extrapolation(&reading) ? "true" : "false");
+    return ferror(stdout) ? EXIT_FAILURE : EXIT_SUCCESS;
+}
+
+/*
+ * Built-in tests require no framework or external libraries.
+ * Expected values cover published breakpoints, truncation and extrapolation.
+ */
+static int run_self_tests(void)
+{
+    static const struct {
+        const char *text;
+        long scale;
+        long expected_concentration;
+        long expected_aqi;
+    } valid_cases[] = {
+        {"0", 10, 0, 0}, {"9.0", 10, 90, 50}, {"9.1", 10, 91, 51},
+        {"35.4", 10, 354, 100}, {"35.5", 10, 355, 101},
+        {"55.4", 10, 554, 150}, {"55.5", 10, 555, 151},
+        {"125.4", 10, 1254, 200}, {"125.5", 10, 1255, 201},
+        {"225.4", 10, 2254, 300}, {"225.5", 10, 2255, 301},
+        {"325.4", 10, 3254, 500}, {"9.09999", 10, 90, 50},
+        {"35.49999", 10, 354, 100}, {"500", 10, 5000, 848},
+        {"10000", 10, 100000, 19772}, {" +25.0 ", 10, 250, 81},
+        {".0", 10, 0, 0}, {"0", 1, 0, 0}, {"54", 1, 54, 50},
+        {"55", 1, 55, 51}, {"154", 1, 154, 100}, {"155", 1, 155, 101},
+        {"254", 1, 254, 150}, {"255", 1, 255, 151}, {"354", 1, 354, 200},
+        {"355", 1, 355, 201}, {"424", 1, 424, 300}, {"425", 1, 425, 301},
+        {"604", 1, 604, 500}, {"54.999", 1, 54, 50},
+        {"700", 1, 700, 607}, {"10000", 1, 10000, 10946}
+    };
+    static const char *const invalid_cases[] = {
+        "", " ", "-", "-1", "-0.1", "NaN", "inf", "1e3", "12abc", "35,5",
+        ".", "+", "++1", "1.2.3", "1 2", "10001", "10000.00001",
+        "999999999999999999999999999999999999"
+    };
+    static const long input_scales[] = {
+        FINE_PARTICLE_SCALE, INHALABLE_PARTICLE_SCALE
+    };
+    static const struct {
+        long aqi;
+        size_t expected_category;
+    } category_cases[] = {
+        {0, 0}, {50, 0}, {51, 1}, {100, 1}, {101, 2}, {150, 2},
+        {151, 3}, {200, 3}, {201, 4}, {300, 4}, {301, 5}, {848, 5}
+    };
+    size_t checks = 0;
+    size_t failures = 0;
+
+    for (size_t test = 0; test < ARRAY_COUNT(valid_cases); ++test) {
+        long concentration = -1;
+        const AqiBreakpoint *bands = valid_cases[test].scale == FINE_PARTICLE_SCALE
+            ? FINE_PARTICLE_BREAKPOINTS : INHALABLE_PARTICLE_BREAKPOINTS;
+        ++checks;
+        if (!parse_concentration(valid_cases[test].text, valid_cases[test].scale,
+                                 &concentration) ||
+            concentration != valid_cases[test].expected_concentration ||
+            calculate_pollutant_aqi(concentration, bands) != valid_cases[test].expected_aqi) {
+            fprintf(stderr, "FAIL: concentration case %zu (%s)\n",
+                    test + 1, valid_cases[test].text);
+            ++failures;
+        }
+    }
+    for (size_t test = 0; test < ARRAY_COUNT(invalid_cases); ++test) {
+        for (size_t scale_index = 0; scale_index < ARRAY_COUNT(input_scales);
+             ++scale_index) {
+            long unchanged_value = 123;
+            ++checks;
+            if (parse_concentration(invalid_cases[test], input_scales[scale_index],
+                                    &unchanged_value) ||
+                unchanged_value != 123) {
+                fprintf(stderr, "FAIL: invalid input case %zu\n", test + 1);
+                ++failures;
+            }
+        }
+    }
+    for (size_t test = 0; test < ARRAY_COUNT(category_cases); ++test) {
+        ++checks;
+        if (classify_air_quality(category_cases[test].aqi) !=
+            category_cases[test].expected_category) {
+            fprintf(stderr, "FAIL: category case %zu\n", test + 1);
+            ++failures;
+        }
+    }
+    AirQualityReading combined = {
+        .fine_particle_tenths = 250, .inhalable_particles = 70
+    };
+    analyze_reading(&combined);
+    ++checks;
+    if (combined.overall_aqi != 81 || combined.inhalable_particle_aqi != 58 ||
+        combined.category_index != 1) {
+        fputs("FAIL: fine-particle maximum selection\n", stderr);
+        ++failures;
+    }
+    combined.fine_particle_tenths = 0;
+    analyze_reading(&combined);
+    ++checks;
+    if (combined.overall_aqi != 58 || combined.fine_particle_aqi != 0) {
+        fputs("FAIL: inhalable-particle maximum selection\n", stderr);
+        ++failures;
+    }
+    combined.inhalable_particles = 0;
+    analyze_reading(&combined);
+    ++checks;
+    if (combined.overall_aqi != 0 || combined.category_index != 0) {
+        fputs("FAIL: equal zero readings\n", stderr);
+        ++failures;
+    }
+    AirQualityReading history[HISTORY_LIMIT] = {0};
+    size_t history_count = 0;
+    for (size_t entry = 0; entry < HISTORY_LIMIT + 2; ++entry) {
+        AirQualityReading reading = {.area_name = "Central District"};
+        reading.fine_particle_tenths = (long)entry * 10;
+        analyze_reading(&reading);
+        save_reading(history, &history_count, &reading);
+    }
+    ++checks;
+    if (history_count != HISTORY_LIMIT || history[0].fine_particle_tenths != 20 ||
+        history[history_count - 1].fine_particle_tenths != (HISTORY_LIMIT + 1) * 10L ||
+        find_previous_reading(history, history_count, "CENTRAL DISTRICT") !=
+            &history[history_count - 1] ||
+        find_previous_reading(history, history_count, "Another Area") != NULL) {
+        fputs("FAIL: history order, capacity or area matching\n", stderr);
+        ++failures;
+    }
+    printf("Self-tests: %zu checks; %zu failures.\n", checks, failures);
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+static void print_welcome_banner(void)
+{
+    puts("+--------------------------------------------------------------------+");
+    puts("|                    URBAN AIR QUALITY ASSISTANT                     |");
+    puts("|                  Hackathon Edition - Standard C11                  |");
+    puts("+--------------------------------------------------------------------+");
+    puts("Understand particle pollution in your area using a daily estimate.");
+    puts("AQI means Air Quality Index. Lower values mean less particle pollution.");
+    puts("Method: United States Environmental Protection Agency (EPA) rules.");
+    puts("PM2.5: Fine Particulate Matter, up to 2.5 micrometers in diameter.");
+    puts("PM10: Inhalable Particulate Matter, up to 10 micrometers in diameter.");
+    puts("Use 24-hour average readings from the same area and period.");
+    puts("Unit: micrograms per cubic meter (one millionth of a gram per cubic meter).");
+    printf("Accepted concentration range: 0 to %ld, using a decimal point.\n",
+           MAX_CONCENTRATION);
+    puts("This program uses manual inputs. It does not fetch live city data.");
+    puts("History lasts for this session; enter observations in time order.");
+}
+
+int main(int argument_count, char *arguments[])
+{
+    if (argument_count == 2 && strcmp(arguments[1], "--self-test") == 0) {
+        return run_self_tests();
+    }
+    if (argument_count == 4 && strcmp(arguments[1], "--json") == 0) {
+        return print_json_report(arguments[2], arguments[3]);
+    }
+    if (argument_count != 1) {
+        fputs("Usage:\n"
+              "  urban_air_quality                  Interactive console\n"
+              "  urban_air_quality --self-test      Run built-in checks\n"
+              "  urban_air_quality --json 35.5 80    Machine-readable result\n"
+              "JSON arguments: PM2.5, then PM10; both are 24-hour averages\n"
+              "in micrograms per cubic meter.\n", stderr);
+        return EXIT_FAILURE;
+    }
+
+    AirQualityReading history[HISTORY_LIMIT] = {0};
+    size_t history_count = 0;
+    bool running = true;
+    char menu_choice[INPUT_CAPACITY];
+
+    print_welcome_banner();
+    while (running) {
+        puts("\nMAIN MENU");
+        puts("  1. Calculate air quality for an area or city");
+        puts("  2. View recent readings and their air quality categories");
+        puts("  3. Run the fictional three-day demonstration");
+        puts("  4. Exit the Urban Air Quality Assistant");
+        if (!read_console_line("Enter a menu option from 1 to 4 (example: 1): ",
+                               menu_choice, sizeof menu_choice)) {
+            break;
+        }
+        if (strlen(menu_choice) != 1) {
+            puts("Invalid menu option. Enter one number from 1 to 4, for example 1.");
+            continue;
+        }
+        switch (menu_choice[0]) {
+            case '1':
+                running = check_area_air_quality(history, &history_count);
+                break;
+            case '2':
+                print_reading_history(history, history_count);
+                break;
+            case '3':
+                run_sample_demonstration();
+                break;
+            case '4':
+                running = false;
+                break;
+            default:
+                puts("Invalid menu option. Enter one number from 1 to 4, for example 1.");
+                break;
+        }
+    }
+    if (ferror(stdin)) {
+        fputs("\nInput could not be read. The program has stopped safely.\n", stderr);
+        return EXIT_FAILURE;
+    }
+    puts("\nThank you for using the Urban Air Quality Assistant. Goodbye.");
+    return ferror(stdout) ? EXIT_FAILURE : EXIT_SUCCESS;
+}

@@ -1,0 +1,6 @@
+{
+  "name": "Urban Air Quality Assistant",
+  "description": "Interactive EPA PM2.5 and PM10 air quality index calculator, health risk advisor, session history tracker, and Gemini contextual assistant.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
